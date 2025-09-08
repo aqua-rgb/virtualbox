@@ -76,9 +76,6 @@
  */
 typedef struct GEFORCESTATE
 {
-    /** The PCI device. */
-    PDMPCIDEV                   PciDev;
-    
     /** Pointer to the device instance. */
     PPDMDEVINS                  pDevIns;
     
@@ -136,6 +133,9 @@ typedef struct GEFORCESTATE
     
     /** Card type identifier (0x35 for NV35/FX5900). */
     uint32_t                    card_type;
+    
+    /** The PCI device. Must be last for compat reasons. */
+    PDMPCIDEV                   PciDev;
     
 } GEFORCESTATE;
 /** Pointer to the device state. */

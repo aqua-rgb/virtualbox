@@ -40,8 +40,12 @@
 #include <iprt/assert.h>
 #include <iprt/string.h>
 #include <iprt/mem.h>
+#include <iprt/uuid.h>
 
 #include "DevGeForce.h"
+
+/* Ensure we're in the right context for device registration. */
+#ifdef IN_RING3
 
 
 /*********************************************************************************************************************************
@@ -230,28 +234,39 @@ static DECLCALLBACK(VBOXSTRICTRC) geforceMMIORead(PPDMDEVINS pDevIns, void *pvUs
     
     LogFlow(("GeForce: MMIO read at 0x%RGp, cb=%u\n", off, cb));
     
+    /* Validate access size and alignment. */
+    if (cb != 1 && cb != 2 && cb != 4)
+    {
+        LogRel(("GeForce: Invalid MMIO read size %u at offset 0x%RGp\n", cb, off));
+        return VINF_IOM_MMIO_UNUSED_FF;
+    }
+    
     /* Handle basic registers for the GeForce FX 5900. */
     switch (off)
     {
         case 0x000000:  /* PMC_BOOT_0 */
             value = 0x03520000 | (pThis->card_type << 16);  /* NV35 = 0x35 */
+            LogFlow(("GeForce: PMC_BOOT_0 read = 0x%08X\n", value));
             break;
             
         case 0x101000:  /* STRAPS */
             value = GEFORCE_STRAPS0_DEFAULT;
+            LogFlow(("GeForce: STRAPS read = 0x%08X\n", value));
             break;
             
         case 0x400100:  /* Graphics interrupt status */
             value = 0;
+            LogFlow(("GeForce: Graphics interrupt status read = 0x%08X\n", value));
             break;
             
         case 0x60013c:  /* Graphics interrupt enable */
             value = 0;
+            LogFlow(("GeForce: Graphics interrupt enable read = 0x%08X\n", value));
             break;
             
         default:
             value = 0;
-            LogFlow(("GeForce: Unhandled MMIO read at 0x%RGp\n", off));
+            LogFlow(("GeForce: Unhandled MMIO read at 0x%RGp, returning 0\n", off));
             break;
     }
     
@@ -526,8 +541,8 @@ static DECLCALLBACK(int) geforceR3Construct(PPDMDEVINS pDevIns, int iInstance, P
      * Register MMIO region for GeForce registers.
      */
     IOMMMIOHANDLE hMmioRegs;
-    rc = PDMDevHlpMmioCreateEx(pDevIns, GEFORCE_PNPMMIO_SIZE, IOMMMIO_FLAGS_READ_DWORD | IOMMMIO_FLAGS_WRITE_DWORD,
-                               pPciDev, 0 /* PCI BAR 0 */, geforceMMIORead, geforceMMIOWrite, NULL /*pfnFill*/,
+    rc = PDMDevHlpMmioCreateEx(pDevIns, GEFORCE_PNPMMIO_SIZE, IOMMMIO_FLAGS_READ_DWORD_QWORD | IOMMMIO_FLAGS_WRITE_DWORD_QWORD_ZEROED,
+                               pPciDev, 0 /* PCI BAR 0 */, geforceMMIOWrite, geforceMMIORead, NULL /*pfnFill*/,
                                NULL /*pvUser*/, "GeForce MMIO", &hMmioRegs);
     AssertRCReturn(rc, rc);
     
@@ -539,7 +554,7 @@ static DECLCALLBACK(int) geforceR3Construct(PPDMDEVINS pDevIns, int iInstance, P
      * Register VRAM as BAR 1.
      */
     rc = PDMDevHlpMmioCreateEx(pDevIns, pThis->cbVRAM, IOMMMIO_FLAGS_READ_PASSTHRU | IOMMMIO_FLAGS_WRITE_PASSTHRU,
-                               pPciDev, 1 /* PCI BAR 1 */, geforceMMIORead, geforceMMIOWrite, NULL /*pfnFill*/,
+                               pPciDev, 1 /* PCI BAR 1 */, geforceMMIOWrite, geforceMMIORead, NULL /*pfnFill*/,
                                NULL /*pvUser*/, "GeForce VRAM", &pThis->hMmio);
     AssertRCReturn(rc, rc);
     
@@ -552,13 +567,11 @@ static DECLCALLBACK(int) geforceR3Construct(PPDMDEVINS pDevIns, int iInstance, P
      */
     rc = PDMDevHlpIoPortCreateFlagsAndMap(pDevIns, 0x3d4, 1, IOM_IOPORT_F_ABS,
                                           geforceIoPortCrtcIndexWrite, geforceIoPortCrtcIndexRead,
-                                          NULL /*pfnOutStr*/, NULL /*pfnInStr*/, NULL /*pvUser*/,
                                           "GeForce CRTC Index", NULL /*paExtDescs*/, &pThis->hIoPortVgaCrt);
     AssertRCReturn(rc, rc);
     
     rc = PDMDevHlpIoPortCreateFlagsAndMap(pDevIns, 0x3d5, 1, IOM_IOPORT_F_ABS,
                                           geforceIoPortCrtcDataWrite, geforceIoPortCrtcDataRead,
-                                          NULL /*pfnOutStr*/, NULL /*pfnInStr*/, NULL /*pvUser*/,
                                           "GeForce CRTC Data", NULL /*paExtDescs*/, &pThis->hIoPortVgaCrt);
     AssertRCReturn(rc, rc);
     
@@ -566,6 +579,33 @@ static DECLCALLBACK(int) geforceR3Construct(PPDMDEVINS pDevIns, int iInstance, P
      * Initialize CRTC and default mode.
      */
     geforceInitCrtc(pThis);
+    
+    /*
+     * Try to attach to a display driver.
+     */
+    rc = PDMDevHlpDriverAttach(pDevIns, 0, &pThis->IBase, &pThis->pDrvBase, "Display Port");
+    if (RT_SUCCESS(rc))
+    {
+        pThis->pDrv = PDMIBASE_QUERY_INTERFACE(pThis->pDrvBase, PDMIDISPLAYCONNECTOR);
+        if (pThis->pDrv)
+        {
+            LogRel(("GeForce: Display driver attached successfully\n"));
+        }
+        else
+        {
+            LogRel(("GeForce: Display driver does not provide PDMIDISPLAYCONNECTOR interface\n"));
+        }
+    }
+    else if (rc == VERR_PDM_NO_ATTACHED_DRIVER)
+    {
+        LogRel(("GeForce: No display driver attached (headless mode)\n"));
+        rc = VINF_SUCCESS;
+    }
+    else
+    {
+        LogRel(("GeForce: Failed to attach display driver, rc=%Rrc\n", rc));
+        return rc;
+    }
     
     /*
      * Register saved state handlers.
@@ -577,6 +617,10 @@ static DECLCALLBACK(int) geforceR3Construct(PPDMDEVINS pDevIns, int iInstance, P
     AssertRCReturn(rc, rc);
     
     LogRel(("GeForce: Emulating GeForce FX 5900 (NV35) with %u MB VRAM\n", pThis->cbVRAM / _1M));
+    LogRel(("GeForce: PCI device %04X:%04X configured with BARs:\n", GEFORCE_PCI_VENDOR_ID, GEFORCE_PCI_DEVICE_ID));
+    LogRel(("GeForce:   BAR 0: MMIO registers (%u MB)\n", GEFORCE_PNPMMIO_SIZE / _1M));
+    LogRel(("GeForce:   BAR 1: Video memory (%u MB)\n", pThis->cbVRAM / _1M));
+    LogRel(("GeForce: VGA-compatible CRTC accessible via I/O ports 0x3D4/0x3D5\n"));
     
     return VINF_SUCCESS;
 }
@@ -658,3 +702,5 @@ const PDMDEVREG g_DeviceGeForce =
 #endif
     /* .u32VersionEnd = */          PDM_DEVREG_VERSION
 };
+
+#endif /* IN_RING3 */
